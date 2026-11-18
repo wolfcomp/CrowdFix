@@ -93,8 +93,7 @@ public unsafe class ConstantBufferReuse: IDisposable
 		public uint DepthPitch;
 	}
 
-	// Entries live in one array and are referred to by index, 0 meaning none. That keeps the large tables free of references, so
-	// the GC has nothing to scan in them and writing a slot needs no write barrier.
+	// Stored in `entries` and referenced by index (0 = none) so the lookup tables hold no references: no GC scanning, no write barriers.
 	private struct Entry
 	{
 		public nint Buffer;
@@ -116,7 +115,7 @@ public unsafe class ConstantBufferReuse: IDisposable
 		public int EntryIndex;
 	}
 
-	// Contents are carved from chunks of this size rather than allocated one by one.
+	// Entry contents are suballocated from chunks of this size.
 	private const int ContentsChunkBytes = 1024 * 1024;
 
 	// Render thread only. 256 entries by address >> 4 can't collide: the 48 caches are 80 bytes apart, so at most 240 apart here.
@@ -126,7 +125,7 @@ public unsafe class ConstantBufferReuse: IDisposable
 	private readonly Slot[] table = new Slot[TableSize];
 	private uint generation = 1;
 
-	// One pool per buffer width, each a list through Entry.NextFree. There can't be more widths than caches.
+	// Free list per buffer width, linked through Entry.NextFree. At most one width per cache, so 256 heads suffice.
 	private readonly Dictionary<uint, int> poolsByWidth = [];
 	private readonly int[] freeHeads = new int[256];
 	private readonly Entry[] entries = new Entry[MaxBuffers + 1];
@@ -156,8 +155,8 @@ public unsafe class ConstantBufferReuse: IDisposable
 	private bool ringUnsupported;
 	private nint lastContext;
 
-	// The ring's state belongs to this thread. Other threads can bind on the same context, like an overlay drawn in a Present
-	// that another plugin calls from its own thread while the render thread builds the next frame.
+	// Only this thread may touch ring state. Other threads can bind on the same context, e.g. a plugin overlay drawn from its own
+	// Present thread mid-frame.
 	private volatile uint renderThreadId;
 
 	// Written on the render thread, read on the framework thread after the hooks are off.
@@ -455,7 +454,7 @@ public unsafe class ConstantBufferReuse: IDisposable
 	}
 
 	/// <summary>
-	/// Each entry is either free or used once, so the used list can't outgrow MaxBuffers.
+	/// An entry is either free or in usedEntries at most once, so usedEntries never exceeds MaxBuffers.
 	/// </summary>
 	private int Acquire(nint context, int index)
 	{
@@ -738,7 +737,7 @@ public unsafe class ConstantBufferReuse: IDisposable
 		int* indices = stackalloc int[MaxBindCount];
 		int[] bound = this.boundEntries;
 
-		// One pass: neighbouring slots of the same kind form a run, which is bound in one call as soon as the next slot differs.
+		// Adjacent slots that are all ring or all passthrough are bound with one call per run.
 		uint runStart = 0;
 		bool runIsRing = false;
 		uint runGeneration = 0;
@@ -750,7 +749,7 @@ public unsafe class ConstantBufferReuse: IDisposable
 				nint buffer = buffers[i];
 				int index = buffer == this.ring ? this.lastRingEntries[firstSlot + i] : buffer == 0 ? 0 : this.FindEntry(buffer);
 
-				// Marked bound before writing, so a wrap the write causes rebinds this entry rather than whatever the slot held before.
+				// Set before WriteToRing so a wrap it triggers rebinds this entry, not the slot's previous one.
 				bound[firstSlot + i] = index;
 				if (index != 0 && this.entries[index].RingGeneration != this.ringGeneration && !this.WriteToRing(context, ref this.entries[index]))
 				{
@@ -773,7 +772,7 @@ public unsafe class ConstantBufferReuse: IDisposable
 			if (i == count || (i != runStart && isRing != runIsRing))
 			{
 				uint runCount = i - runStart;
-				// A wrap since a ring run began moved its entries. The wrap wrote them again because they're marked bound.
+				// A wrap during this run rewrote its entries (they're in boundEntries) at new offsets, so refresh them.
 				if (runCount != 0 && runIsRing && runGeneration != this.ringGeneration)
 				{
 					for (uint j = runStart; j < i; j++)
@@ -803,9 +802,9 @@ public unsafe class ConstantBufferReuse: IDisposable
 	}
 
 	/// <summary>
-	/// Another thread changes nothing here and writes nothing to the ring, since the render thread uses both meanwhile. Its own
-	/// buffers pass through. The ring is what an overlay restores, so it gets the slot's last ring offset back while that data is
-	/// still in the ring, and otherwise passes through as it came.
+	/// Binds from a non-render thread. Leaves tracking state and the ring untouched since the render thread owns them. Non-ring
+	/// buffers pass through. A ring binding (e.g. an overlay restoring state) gets the slot's last ring offset if that data is
+	/// from the current ring generation, otherwise passes through unchanged.
 	/// </summary>
 	private void SetFromOtherThread(int stage, Hook<SetConstantBuffersDelegate> hook, nint context, uint start, uint count, nint* buffers)
 	{
