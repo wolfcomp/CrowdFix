@@ -72,6 +72,8 @@ public unsafe class ConstantBufferReuse: IDisposable
 
 	internal const string ConstantBufferCacheSignature = "E8 ?? ?? ?? ?? 48 8B 6C 24 ?? 88 44 37";
 
+	[DllImport("kernel32.dll")] private static extern uint GetCurrentThreadId();
+
 	[StructLayout(LayoutKind.Sequential)]
 	private struct BufferDesc
 	{
@@ -153,6 +155,10 @@ public unsafe class ConstantBufferReuse: IDisposable
 	private volatile bool ringStopRequested;
 	private bool ringUnsupported;
 	private nint lastContext;
+
+	// The ring's state belongs to this thread. Other threads can bind on the same context, like an overlay drawn in a Present
+	// that another plugin calls from its own thread while the render thread builds the next frame.
+	private volatile uint renderThreadId;
 
 	// Written on the render thread, read on the framework thread after the hooks are off.
 	private readonly List<nint> knownCaches = [];
@@ -321,6 +327,7 @@ public unsafe class ConstantBufferReuse: IDisposable
 	private void ProcessCommandsDetour(nint context, nint commands, uint commandCount)
 	{
 		this.frames++;
+		this.renderThreadId = GetCurrentThreadId();
 		if (this.ringStopRequested)
 			this.StopRing();
 
@@ -709,6 +716,12 @@ public unsafe class ConstantBufferReuse: IDisposable
 			return;
 		}
 
+		if (GetCurrentThreadId() != this.renderThreadId)
+		{
+			this.SetFromOtherThread(stage, hook, context, start, count, buffers);
+			return;
+		}
+
 		int firstSlot = (stage * ConstantBufferSlots) + (int)start;
 		if (buffers == null || count == 0 || count > MaxBindCount || start + count > ConstantBufferSlots)
 		{
@@ -786,6 +799,36 @@ public unsafe class ConstantBufferReuse: IDisposable
 				runGeneration = this.ringGeneration;
 
 			runIsRing = isRing;
+		}
+	}
+
+	/// <summary>
+	/// Another thread changes nothing here and writes nothing to the ring, since the render thread uses both meanwhile. Its own
+	/// buffers pass through. The ring is what an overlay restores, so it gets the slot's last ring offset back while that data is
+	/// still in the ring, and otherwise passes through as it came.
+	/// </summary>
+	private void SetFromOtherThread(int stage, Hook<SetConstantBuffersDelegate> hook, nint context, uint start, uint count, nint* buffers)
+	{
+		if (buffers == null || count == 0 || count > MaxBindCount || start + count > ConstantBufferSlots)
+		{
+			hook.Original(context, start, count, buffers);
+			return;
+		}
+
+		for (uint i = 0; i < count; i++)
+		{
+			int index = buffers[i] == this.ring ? this.lastRingEntries[(stage * ConstantBufferSlots) + (int)(start + i)] : 0;
+			if (index != 0 && this.entries[index].RingGeneration == this.ringGeneration)
+			{
+				nint buffer = this.ring;
+				uint first = this.entries[index].RingOffset / 16;
+				uint constants = ConstantsOf(ref this.entries[index]);
+				this.SetRange(stage, start + i, 1, &buffer, &first, &constants);
+			}
+			else
+			{
+				hook.Original(context, start + i, 1, buffers + i);
+			}
 		}
 	}
 
